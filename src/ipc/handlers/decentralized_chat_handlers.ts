@@ -53,17 +53,8 @@ let createHelia: any;
 let json: any;
 let FsBlockstore: any;
 let FsDatastore: any;
-let createLibp2p: any;
-let tcp: any;
-let webSockets: any;
-let noise: any;
-let yamux: any;
-let mplex: any;
 let gossipsub: any;
-let identify: any;
 let kadDHT: any;
-let mdns: any;
-let bootstrap: any;
 
 async function loadCryptoModules() {
   if (!nacl) {
@@ -124,6 +115,22 @@ async function loadHeliaModules() {
     
     const datastoreModule = await import("datastore-fs");
     FsDatastore = datastoreModule.FsDatastore;
+    
+    // Load gossipsub for pubsub messaging
+    try {
+      const gossipsubModule = await import("@chainsafe/libp2p-gossipsub");
+      gossipsub = gossipsubModule.gossipsub;
+    } catch (e) {
+      logger.warn("Failed to load gossipsub:", e);
+    }
+    
+    // Load kadDHT for distributed hash table
+    try {
+      const kadDHTModule = await import("@libp2p/kad-dht");
+      kadDHT = kadDHTModule.kadDHT;
+    } catch (e) {
+      logger.warn("Failed to load kadDHT:", e);
+    }
   }
 }
 
@@ -1141,17 +1148,28 @@ async function subscribeToConversation(conversationId: string): Promise<void> {
   try {
     await ensureChatHelia();
     
-    // Subscribe using gossipsub
+    // Try to subscribe via libp2p pubsub if available
     if (chatHelia?.libp2p?.services?.pubsub) {
       chatHelia.libp2p.services.pubsub.subscribe(topic);
-      activeSubscriptions.add(topic);
-      logger.info("Subscribed to conversation", { conversationId, topic });
-    } else {
-      logger.warn("PubSub not available, tracking subscription locally", { conversationId });
-      activeSubscriptions.add(topic);
+      
+      // Set up message handler
+      chatHelia.libp2p.services.pubsub.addEventListener("message", (evt: any) => {
+        if (evt.detail.topic === topic) {
+          handlePubSubMessage(topic, evt.detail.data).catch(err => {
+            logger.error("Error handling pubsub message:", err);
+          });
+        }
+      });
+      
+      logger.info("Subscribed to conversation via PubSub", { conversationId, topic });
     }
+    
+    activeSubscriptions.add(topic);
+    logger.info("Subscribed to conversation", { conversationId, topic });
   } catch (error) {
     logger.error("Failed to subscribe to conversation:", error);
+    // Still track subscription for local handling
+    activeSubscriptions.add(topic);
   }
 }
 
@@ -1185,20 +1203,31 @@ async function publishMessage(conversationId: string, message: ChatMessage): Pro
   try {
     await ensureChatHelia();
     
-    // Ensure we're subscribed to the topic before publishing
-    await subscribeToConversation(conversationId);
-    
+    // Try to publish via libp2p pubsub if available
     if (chatHelia?.libp2p?.services?.pubsub) {
-      await loadCryptoModules();
-      const data = naclUtil.decodeUTF8(JSON.stringify(pubsubMessage));
+      const encoder = new TextEncoder();
+      const data = encoder.encode(JSON.stringify(pubsubMessage));
       await chatHelia.libp2p.services.pubsub.publish(topic, data);
       logger.info("Published message to PubSub", { topic, messageId: message.id });
     } else {
-      logger.warn("PubSub not available, message not published", { messageId: message.id });
+      logger.debug("PubSub not available, message pinned to IPFS only", { messageId: message.id });
+    }
+    
+    // Also publish to presence topic for discovery
+    const presenceTopic = `/joycreate/chat/v1/presence`;
+    if (chatHelia?.libp2p?.services?.pubsub) {
+      const presenceMsg = {
+        type: "message:available",
+        senderId: message.sender,
+        conversationId,
+        cid: message.cid,
+        timestamp: new Date().toISOString(),
+      };
+      const presenceData = new TextEncoder().encode(JSON.stringify(presenceMsg));
+      await chatHelia.libp2p.services.pubsub.publish(presenceTopic, presenceData);
     }
   } catch (error) {
-    logger.error("Failed to publish message to PubSub:", error);
-    throw error;
+    logger.warn("Failed to publish to PubSub:", error);
   }
 }
 
@@ -1408,27 +1437,125 @@ async function checkOfflineMessages(): Promise<ChatMessage[]> {
 }
 
 // ============================================================================
-// DHT Operations
+// DHT Operations (with local storage fallback)
 // ============================================================================
 
+// DHT cache stored locally for offline message discovery
+const dhtCache = new Map<string, { value: any; timestamp: string }>();
+const dhtCacheFile = () => path.join(getChatDir(), "dht-cache.json");
+
+async function loadDHTCache(): Promise<void> {
+  try {
+    const cachePath = dhtCacheFile();
+    if (await fs.pathExists(cachePath)) {
+      const data = await fs.readJson(cachePath);
+      for (const [key, entry] of Object.entries(data)) {
+        dhtCache.set(key, entry as { value: any; timestamp: string });
+      }
+      logger.debug("Loaded DHT cache", { entries: dhtCache.size });
+    }
+  } catch (error) {
+    logger.warn("Failed to load DHT cache:", error);
+  }
+}
+
+async function saveDHTCache(): Promise<void> {
+  try {
+    const data: Record<string, any> = {};
+    for (const [key, entry] of dhtCache) {
+      data[key] = entry;
+    }
+    await fs.writeJson(dhtCacheFile(), data, { spaces: 2 });
+  } catch (error) {
+    logger.warn("Failed to save DHT cache:", error);
+  }
+}
+
 /**
- * Publish to DHT
+ * Publish to DHT (with local fallback)
  */
 async function publishToDHT(key: string, value: any): Promise<void> {
   try {
-    // Would use Helia's DHT
-    logger.debug("Publishing to DHT", { key });
+    // Store locally first for fallback
+    dhtCache.set(key, { value, timestamp: new Date().toISOString() });
+    await saveDHTCache();
+    
+    // Try to publish to Helia's DHT if available
+    if (chatHelia?.libp2p?.services?.dht) {
+      const encoder = new TextEncoder();
+      const valueBytes = encoder.encode(JSON.stringify(value));
+      await chatHelia.libp2p.services.dht.put(
+        encoder.encode(key),
+        valueBytes
+      );
+      logger.debug("Published to DHT", { key });
+    }
+    
+    // Also store as pinned JSON for IPFS discovery
+    const cid = await storeChatJSON({ key, value, timestamp: new Date().toISOString() });
+    
+    // Store CID mapping locally for retrieval
+    const mappingPath = path.join(getChatDir(), "dht-mappings.json");
+    let mappings: Record<string, string> = {};
+    if (await fs.pathExists(mappingPath)) {
+      mappings = await fs.readJson(mappingPath);
+    }
+    mappings[key] = cid;
+    await fs.writeJson(mappingPath, mappings, { spaces: 2 });
+    
+    logger.info("Published to DHT with CID", { key, cid });
   } catch (error) {
     logger.warn("Failed to publish to DHT:", error);
   }
 }
 
 /**
- * Get from DHT
+ * Get from DHT (with local fallback)
  */
 async function getFromDHT(key: string): Promise<any | null> {
   try {
-    // Would use Helia's DHT
+    // Try to get from Helia's DHT first
+    if (chatHelia?.libp2p?.services?.dht) {
+      try {
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+        const result = await chatHelia.libp2p.services.dht.get(encoder.encode(key));
+        if (result) {
+          const value = JSON.parse(decoder.decode(result));
+          // Update local cache
+          dhtCache.set(key, { value, timestamp: new Date().toISOString() });
+          await saveDHTCache();
+          return value;
+        }
+      } catch (e) {
+        // DHT lookup failed, try fallback
+      }
+    }
+    
+    // Try local cache
+    const cached = dhtCache.get(key);
+    if (cached) {
+      return cached.value;
+    }
+    
+    // Try to load from CID mapping
+    const mappingPath = path.join(getChatDir(), "dht-mappings.json");
+    if (await fs.pathExists(mappingPath)) {
+      const mappings = await fs.readJson(mappingPath);
+      if (mappings[key]) {
+        try {
+          const data = await getChatJSON(mappings[key]);
+          if (data?.value) {
+            dhtCache.set(key, { value: data.value, timestamp: data.timestamp });
+            await saveDHTCache();
+            return data.value;
+          }
+        } catch (e) {
+          // CID fetch failed
+        }
+      }
+    }
+    
     return null;
   } catch (error) {
     logger.warn("Failed to get from DHT:", error);
@@ -1597,7 +1724,7 @@ async function getChatServiceStatus(): Promise<ChatServiceStatus> {
     pubsubEnabled: activeSubscriptions.size > 0,
     activeTopics: Array.from(activeSubscriptions),
     dhtEnabled: true,
-    dhtRecords: 0,
+    dhtRecords: dhtCache.size,
     conversationCount: convs.length,
     messageCount,
     pinnedMessageCount: pins.size,
@@ -1608,6 +1735,77 @@ async function getChatServiceStatus(): Promise<ChatServiceStatus> {
   };
 }
 
+/**
+ * Subscribe to global presence topic for message discovery
+ */
+async function subscribeToGlobalPresence(): Promise<void> {
+  const presenceTopic = `/joycreate/chat/v1/presence`;
+  
+  if (activeSubscriptions.has(presenceTopic)) {
+    return;
+  }
+  
+  try {
+    await ensureChatHelia();
+    
+    if (chatHelia?.libp2p?.services?.pubsub) {
+      chatHelia.libp2p.services.pubsub.subscribe(presenceTopic);
+      
+      chatHelia.libp2p.services.pubsub.addEventListener("message", async (evt: any) => {
+        if (evt.detail.topic === presenceTopic) {
+          try {
+            const decoder = new TextDecoder();
+            const message = JSON.parse(decoder.decode(evt.detail.data));
+            
+            // Handle message availability notifications
+            if (message.type === "message:available" && message.cid) {
+              // Check if this is for one of our conversations
+              const convs = await listConversations();
+              const conv = convs.find(c => c.id === message.conversationId);
+              
+              if (conv && message.senderId !== localIdentity?.walletAddress) {
+                // Pull the message
+                logger.info("Received message notification, pulling from IPFS", { cid: message.cid });
+                const result = await pullPinnedMessages({ cids: [message.cid] });
+                
+                if (result.messages.length > 0) {
+                  emitChatEvent({
+                    type: "message:received",
+                    message: result.messages[0],
+                    conversationId: message.conversationId,
+                  });
+                }
+              }
+            }
+            
+            // Handle presence updates
+            if (message.type === "presence:update" && message.senderId) {
+              presenceCache.set(message.senderId, {
+                status: message.payload?.status || "online",
+                lastSeen: message.timestamp,
+              });
+              
+              emitChatEvent({
+                type: "presence:updated",
+                userId: message.senderId,
+                status: message.payload?.status || "online",
+              });
+            }
+          } catch (e) {
+            logger.warn("Failed to process presence message:", e);
+          }
+        }
+      });
+      
+      logger.info("Subscribed to global presence topic");
+    }
+    
+    activeSubscriptions.add(presenceTopic);
+  } catch (error) {
+    logger.error("Failed to subscribe to global presence:", error);
+  }
+}
+
 // ============================================================================
 // Register IPC Handlers
 // ============================================================================
@@ -1615,9 +1813,22 @@ async function getChatServiceStatus(): Promise<ChatServiceStatus> {
 export function registerDecentralizedChatHandlers(): void {
   initChatDirs();
   
+  // Load DHT cache and identity on startup
+  loadDHTCache().catch(err => logger.warn("Failed to load DHT cache:", err));
+  loadChatIdentity().then(identity => {
+    if (identity) {
+      logger.info("Loaded existing chat identity", { walletAddress: identity.walletAddress });
+      // Subscribe to global presence for message discovery
+      subscribeToGlobalPresence().catch(err => logger.warn("Failed to subscribe to presence:", err));
+    }
+  }).catch(err => logger.warn("Failed to load chat identity:", err));
+  
   // Identity
   ipcMain.handle("dchat:identity:create", async (_, walletAddress: string, displayName?: string, signature?: string) => {
-    return createChatIdentity(walletAddress, displayName, signature);
+    const result = await createChatIdentity(walletAddress, displayName, signature);
+    // Subscribe to presence after identity creation
+    subscribeToGlobalPresence().catch(err => logger.warn("Failed to subscribe to presence:", err));
+    return result;
   });
   
   ipcMain.handle("dchat:identity:get", async () => {
