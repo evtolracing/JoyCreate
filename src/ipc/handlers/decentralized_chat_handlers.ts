@@ -53,6 +53,17 @@ let createHelia: any;
 let json: any;
 let FsBlockstore: any;
 let FsDatastore: any;
+let createLibp2p: any;
+let tcp: any;
+let webSockets: any;
+let noise: any;
+let yamux: any;
+let mplex: any;
+let gossipsub: any;
+let identify: any;
+let kadDHT: any;
+let mdns: any;
+let bootstrap: any;
 
 async function loadCryptoModules() {
   if (!nacl) {
@@ -60,6 +71,43 @@ async function loadCryptoModules() {
     nacl = naclModule.default || naclModule;
     const naclUtilModule = await import("tweetnacl-util");
     naclUtil = naclUtilModule.default || naclUtilModule;
+  }
+}
+
+async function loadLibp2pModules() {
+  if (!createLibp2p) {
+    const libp2pModule = await import("libp2p");
+    createLibp2p = libp2pModule.createLibp2p;
+    
+    const tcpModule = await import("@libp2p/tcp");
+    tcp = tcpModule.tcp;
+    
+    const wsModule = await import("@libp2p/websockets");
+    webSockets = wsModule.webSockets;
+    
+    const noiseModule = await import("@chainsafe/libp2p-noise");
+    noise = noiseModule.noise;
+    
+    const yamuxModule = await import("@chainsafe/libp2p-yamux");
+    yamux = yamuxModule.yamux;
+    
+    const mplexModule = await import("@libp2p/mplex");
+    mplex = mplexModule.mplex;
+    
+    const gossipsubModule = await import("@chainsafe/libp2p-gossipsub");
+    gossipsub = gossipsubModule.gossipsub;
+    
+    const identifyModule = await import("@libp2p/identify");
+    identify = identifyModule.identify;
+    
+    const dhtModule = await import("@libp2p/kad-dht");
+    kadDHT = dhtModule.kadDHT;
+    
+    const mdnsModule = await import("@libp2p/mdns");
+    mdns = mdnsModule.mdns;
+    
+    const bootstrapModule = await import("@libp2p/bootstrap");
+    bootstrap = bootstrapModule.bootstrap;
   }
 }
 
@@ -86,6 +134,7 @@ let chatJsonCodec: any = null;
 async function ensureChatHelia(): Promise<void> {
   if (chatHelia) return;
   
+  await loadLibp2pModules();
   await loadHeliaModules();
   
   const storagePath = path.join(getChatDir(), "helia-store");
@@ -100,15 +149,47 @@ async function ensureChatHelia(): Promise<void> {
   const blockstore = new FsBlockstore(blockstorePath);
   const datastore = new FsDatastore(datastorePath);
   
+  // Create libp2p node with gossipsub for real-time messaging
+  const libp2pNode = await createLibp2p({
+    addresses: {
+      listen: ["/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/tcp/0/ws"],
+    },
+    transports: [tcp(), webSockets()],
+    connectionEncrypters: [noise()],
+    streamMuxers: [yamux(), mplex()],
+    peerDiscovery: [mdns()],
+    services: {
+      identify: identify(),
+      dht: kadDHT({ clientMode: false }),
+      pubsub: gossipsub({
+        allowPublishToZeroTopicPeers: true,
+        emitSelf: true, // Important: emit to self so sender sees their own messages
+      }),
+    },
+  });
+  
+  // Start the libp2p node
+  await libp2pNode.start();
+  
   chatHelia = await createHelia({
     blockstore,
     datastore,
+    libp2p: libp2pNode,
   });
   
   chatJsonCodec = json(chatHelia);
   
-  logger.info("Chat Helia node started", {
+  // Set up pubsub message handler
+  libp2pNode.services.pubsub.addEventListener("message", async (evt: any) => {
+    const topic = evt.detail.topic;
+    const data = evt.detail.data;
+    logger.debug("Received pubsub message", { topic });
+    await handlePubSubMessage(topic, data);
+  });
+  
+  logger.info("Chat Helia node started with gossipsub", {
     peerId: chatHelia.libp2p.peerId.toString(),
+    addresses: libp2pNode.getMultiaddrs().map((ma: any) => ma.toString()),
   });
 }
 
@@ -613,6 +694,7 @@ async function getConversation(conversationId: string): Promise<ChatConversation
  */
 async function listConversations(): Promise<ChatConversation[]> {
   const convDir = getConversationsDir();
+  await fs.ensureDir(convDir);
   const files = await fs.readdir(convDir);
   
   const convs: ChatConversation[] = [];
@@ -622,6 +704,12 @@ async function listConversations(): Promise<ChatConversation[]> {
         const conv = await fs.readJson(path.join(convDir, file));
         conversations.set(conv.id, conv);
         convs.push(conv);
+        
+        // Auto-subscribe to conversation for real-time messages
+        // This is done asynchronously to not block listing
+        subscribeToConversation(conv.id).catch(err => {
+          logger.debug("Failed to subscribe to conversation on load", { convId: conv.id, error: err });
+        });
       } catch (error) {
         logger.warn("Failed to load conversation:", { file, error });
       }
@@ -1051,10 +1139,17 @@ async function subscribeToConversation(conversationId: string): Promise<void> {
   }
   
   try {
-    // Would use Helia's libp2p pubsub
-    // For now, track subscriptions
-    activeSubscriptions.add(topic);
-    logger.info("Subscribed to conversation", { conversationId, topic });
+    await ensureChatHelia();
+    
+    // Subscribe using gossipsub
+    if (chatHelia?.libp2p?.services?.pubsub) {
+      chatHelia.libp2p.services.pubsub.subscribe(topic);
+      activeSubscriptions.add(topic);
+      logger.info("Subscribed to conversation", { conversationId, topic });
+    } else {
+      logger.warn("PubSub not available, tracking subscription locally", { conversationId });
+      activeSubscriptions.add(topic);
+    }
   } catch (error) {
     logger.error("Failed to subscribe to conversation:", error);
   }
@@ -1075,13 +1170,36 @@ async function publishMessage(conversationId: string, message: ChatMessage): Pro
       cid: message.cid,
       messageType: message.messageType,
       timestamp: message.createdAt,
+      // Include full message data for real-time delivery
+      encryptedContent: message.encryptedContent,
+      nonce: message.nonce,
+      recipients: message.recipients,
+      senderDid: message.senderDid,
+      signature: message.signature,
+      messageHash: message.messageHash,
     },
     timestamp: new Date().toISOString(),
     signature: await signMessage(JSON.stringify(message)),
   };
   
-  // Would publish via libp2p
-  logger.debug("Publishing message to PubSub", { topic, messageId: message.id });
+  try {
+    await ensureChatHelia();
+    
+    // Ensure we're subscribed to the topic before publishing
+    await subscribeToConversation(conversationId);
+    
+    if (chatHelia?.libp2p?.services?.pubsub) {
+      await loadCryptoModules();
+      const data = naclUtil.decodeUTF8(JSON.stringify(pubsubMessage));
+      await chatHelia.libp2p.services.pubsub.publish(topic, data);
+      logger.info("Published message to PubSub", { topic, messageId: message.id });
+    } else {
+      logger.warn("PubSub not available, message not published", { messageId: message.id });
+    }
+  } catch (error) {
+    logger.error("Failed to publish message to PubSub:", error);
+    throw error;
+  }
 }
 
 /**
@@ -1090,46 +1208,112 @@ async function publishMessage(conversationId: string, message: ChatMessage): Pro
 async function handlePubSubMessage(topic: string, data: Uint8Array): Promise<void> {
   try {
     await loadCryptoModules();
-    const message = JSON.parse(naclUtil.encodeUTF8(data)) as ChatPubSubMessage;
+    const pubsubMsg = JSON.parse(naclUtil.encodeUTF8(data)) as ChatPubSubMessage;
     
-    switch (message.type) {
-      case "message:new":
-        // Pull the message from IPFS if we have the CID
-        if (message.payload.cid) {
-          await pullPinnedMessages({ cids: [message.payload.cid] });
+    logger.debug("Processing incoming PubSub message", { 
+      type: pubsubMsg.type, 
+      conversationId: pubsubMsg.conversationId,
+      senderId: pubsubMsg.senderId,
+    });
+    
+    switch (pubsubMsg.type) {
+      case "message:new": {
+        const payload = pubsubMsg.payload;
+        
+        // Skip if this is our own message (we already have it)
+        if (localIdentity && pubsubMsg.senderId === localIdentity.walletAddress) {
+          logger.debug("Skipping own message", { messageId: payload.messageId });
+          return;
         }
-        emitChatEvent({
-          type: "message:received",
-          message: message.payload,
-          conversationId: message.conversationId,
-        });
+        
+        // Reconstruct the ChatMessage from payload
+        const chatMessage: ChatMessage = {
+          id: payload.messageId,
+          conversationId: pubsubMsg.conversationId,
+          sender: pubsubMsg.senderId,
+          senderDid: payload.senderDid || `did:joy:chat:${pubsubMsg.senderId.toLowerCase()}`,
+          recipients: payload.recipients || [],
+          encryptedContent: payload.encryptedContent || "",
+          nonce: payload.nonce || "",
+          encryptionAlgorithm: "x25519-xsalsa20-poly1305" as EncryptionAlgorithm,
+          messageType: payload.messageType || "text",
+          deliveryStatus: "delivered" as DeliveryStatus,
+          readReceipts: [],
+          signature: payload.signature || "",
+          messageHash: payload.messageHash || "",
+          createdAt: payload.timestamp,
+          cid: payload.cid,
+        };
+        
+        // Store message locally
+        if (!messages.has(pubsubMsg.conversationId)) {
+          messages.set(pubsubMsg.conversationId, []);
+        }
+        
+        // Check if we already have this message
+        const existingMessages = messages.get(pubsubMsg.conversationId)!;
+        const alreadyExists = existingMessages.some(m => m.id === chatMessage.id);
+        
+        if (!alreadyExists) {
+          existingMessages.push(chatMessage);
+          
+          // Save to disk
+          const msgPath = path.join(getMessagesDir(), pubsubMsg.conversationId);
+          await fs.ensureDir(msgPath);
+          await fs.writeJson(path.join(msgPath, `${chatMessage.id}.json`), chatMessage, { spaces: 2 });
+          
+          logger.info("Stored received message", { 
+            messageId: chatMessage.id, 
+            conversationId: pubsubMsg.conversationId,
+            sender: pubsubMsg.senderId,
+          });
+          
+          // Emit event to UI
+          emitChatEvent({
+            type: "message:received",
+            message: chatMessage,
+            conversationId: pubsubMsg.conversationId,
+          });
+          
+          // Also try to pull from IPFS if we have the CID (for verification)
+          if (payload.cid) {
+            try {
+              await pullPinnedMessages({ cids: [payload.cid] });
+            } catch (error) {
+              logger.debug("Could not pull message from IPFS (may be offline)", { cid: payload.cid });
+            }
+          }
+        } else {
+          logger.debug("Message already exists, skipping", { messageId: chatMessage.id });
+        }
         break;
+      }
         
       case "typing:start":
         emitChatEvent({
           type: "typing:started",
-          conversationId: message.conversationId,
-          userId: message.senderId,
+          conversationId: pubsubMsg.conversationId,
+          userId: pubsubMsg.senderId,
         });
         break;
         
       case "typing:stop":
         emitChatEvent({
           type: "typing:stopped",
-          conversationId: message.conversationId,
-          userId: message.senderId,
+          conversationId: pubsubMsg.conversationId,
+          userId: pubsubMsg.senderId,
         });
         break;
         
       case "presence:update":
-        presenceCache.set(message.senderId, {
-          status: message.payload.status,
-          lastSeen: message.timestamp,
+        presenceCache.set(pubsubMsg.senderId, {
+          status: pubsubMsg.payload.status,
+          lastSeen: pubsubMsg.timestamp,
         });
         emitChatEvent({
           type: "presence:changed",
-          userId: message.senderId,
-          status: message.payload.status,
+          userId: pubsubMsg.senderId,
+          status: pubsubMsg.payload.status,
         });
         break;
     }
