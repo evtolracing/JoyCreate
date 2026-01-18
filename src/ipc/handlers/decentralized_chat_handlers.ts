@@ -56,8 +56,10 @@ let FsDatastore: any;
 
 async function loadCryptoModules() {
   if (!nacl) {
-    nacl = await import("tweetnacl");
-    naclUtil = await import("tweetnacl-util");
+    const naclModule = await import("tweetnacl");
+    nacl = naclModule.default || naclModule;
+    const naclUtilModule = await import("tweetnacl-util");
+    naclUtil = naclUtilModule.default || naclUtilModule;
   }
 }
 
